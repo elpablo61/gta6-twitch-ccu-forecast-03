@@ -58,12 +58,8 @@ import math
 import os
 import re
 import statistics
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-# The grader's -P leaves /bot off sys.path: put it back first, so `import model` finds a model.py shipped beside this file.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
@@ -253,6 +249,10 @@ def forecast(p1, ch1, train, target_platforms=None, target_unlock=None,
         res, res_x = [], []
         for i, t in enumerate(ok):
             loo_xs = xs_h[:i] + xs_h[i + 1:]
+            if not loo_xs:
+                # A single point has no leave-one-out residual: skip it
+                # (its centre is the point itself; sigma falls back below).
+                continue
             loo_ys = ys[:i] + ys[i + 1:]
             loo_ws = ws_pc[:i] + ws_pc[i + 1:]
             xi = xs_h[i]
@@ -268,10 +268,15 @@ def forecast(p1, ch1, train, target_platforms=None, target_unlock=None,
             ci = ALPHA * li + (1 - ALPHA) * ri
             res.append(ys[i] - ci)
             res_x.append(xi)
-        kw = [_kernel((x - x0c) / SIGMA_BW) for x in res_x]
-        med = _wquantile(list(zip(res, kw)), 0.5)
-        mad = _wquantile(list(zip([abs(r - med) for r in res], kw)), 0.5)
-        sigma = max(0.05, 1.4826 * mad)
+        if res:
+            kw = [_kernel((x - x0c) / SIGMA_BW) for x in res_x]
+            med = _wquantile(list(zip(res, kw)), 0.5)
+            mad = _wquantile(list(zip([abs(r - med) for r in res], kw)), 0.5)
+            sigma = max(0.05, 1.4826 * mad)
+            if not math.isfinite(sigma):
+                sigma = 0.15
+        else:
+            sigma = 0.15
         out[h] = (centre, sigma, ys, xs_h)
     # Smooth sigma across hours (3-hour moving average).
     sig = {}
@@ -401,9 +406,11 @@ def forecast_case(case, name):
                 break
     fc = forecast(p1, ch1, train, target_platforms,
                   case.get("notes"), case.get("day_start"))
+    # Build rows from HOURS, not from the input's forecast list, so the
+    # output is exactly 23 rows (hours 2..24) even if that list is short,
+    # reordered, or holds an out-of-range hour.
     hours = []
-    for row in case["forecast"]:
-        h = row["hour"]
+    for h in HOURS:
         qs = [round2(q) for q in fc[h]]
         hours.append({"hour": h, "q": qs})
     return {"hours": hours}
@@ -414,7 +421,16 @@ def main():
     # Every case file, in name order, so two runs write the same bytes.
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        fc = forecast_case(case, path.name)
+        try:
+            fc = forecast_case(case, path.name)
+        except Exception:
+            # Never lose a whole case to one bad hour: fall back to the
+            # hour-1 print held flat — a valid, if uninformative, forecast.
+            first = next((k for k in case.get("known", [])
+                          if k.get("hour") == 1), None)
+            p1 = max(1, first["viewers"]) if first else 1
+            fc = {"hours": [{"hour": h, "q": [round2(float(p1))] * 5}
+                            for h in HOURS]}
         (OUTPUT_DIR / f"{path.stem}.out").write_text(
             json.dumps(fc, separators=(",", ":")) + "\n", encoding="utf-8")
 
